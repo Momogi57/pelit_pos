@@ -490,30 +490,36 @@ def process_transaction(customer_id: str, total_amount: float, items: List[Dict]
     """
     Process transaction with normalized database structure and price snapshots
     Implements transaction-like behavior: all or nothing
+    Steps:
+    1. Validate stock availability
+    2. Create transaction header
+    3. Create transaction items with price snapshots
+    4. Perform atomic stock updates
+    5. Log stock movements
     """
     transaction_id = None
     items_created = []
+    stock_updated = []
     
     try:
-        # Step 1: Validate stock availability (PASTIKAN TIPEDATA INTEGER)
+        # Step 1: Validate stock availability for ALL items first
         products_df = fetch_products()
         for item in items:
-            product_row = products_df[products_df['produk_id'] == int(item['product_id'])]
+            product_row = products_df[products_df['produk_id'] == item['product_id']]
             if product_row.empty:
                 return False, f"Produk {item['product_name']} tidak ditemukan", None
             
             current_stock = int(product_row.iloc[0]['stok'])
-            if current_stock < int(item['quantity']):
+            if current_stock < item['quantity']:
                 return False, f"Stok tidak mencukupi untuk {item['product_name']} (Tersedia: {current_stock})", None
         
         # Step 2: Create transaction header
-        # FIX: Gunakan str() untuk ID, float() untuk angka desimal
         transaction_id = generate_unique_id("TRX")
         transaction_data = {
-            "transaksi_id": str(transaction_id),
-            "pelanggan_id": str(customer_id),
-            "total_bayar": float(total_amount),
-            "diskon": float(discount),
+            "transaksi_id": transaction_id,
+            "pelanggan_id": customer_id,
+            "total_bayar": total_amount,
+            "diskon": discount,
             "tanggal_transaksi": get_current_datetime().isoformat()
         }
         supabase.table("transaksi").insert(transaction_data).execute()
@@ -521,45 +527,52 @@ def process_transaction(customer_id: str, total_amount: float, items: List[Dict]
         # Step 3: Create transaction items with PRICE SNAPSHOTS
         for item in items:
             item_data = {
-                "transaksi_id": str(transaction_id),
-                "produk_id": int(item['product_id']),
-                "nama_produk": str(item['product_name']),
-                "harga_satuan": float(item['price']),
-                "jumlah": int(item['quantity']),
-                "subtotal": float(item['price'] * item['quantity'])
+                "transaksi_id": transaction_id,
+                "produk_id": item['product_id'],
+                "nama_produk": item['product_name'],  # Snapshot of product name
+                "harga_satuan": item['price'],  # PRICE SNAPSHOT - critical for historical accuracy
+                "jumlah": item['quantity'],
+                "subtotal": item['price'] * item['quantity']
             }
             supabase.table("transaksi_item").insert(item_data).execute()
             items_created.append(item['product_id'])
             
-            # Step 4: Perform ATOMIC stock update (MENGGUNAKAN INTEGER STANDAR)
-            success, message = atomic_stock_update(int(item['product_id']), int(item['quantity']))
+            # Step 4: Perform ATOMIC stock update (prevents race conditions)
+            success, message = atomic_stock_update(item['product_id'], item['quantity'])
             if not success:
-                # Rollback logic
+                # Rollback: delete transaction items and header
                 for created_product_id in items_created:
-                    supabase.table("transaksi_item").delete().eq("transaksi_id", transaction_id).eq("produk_id", int(created_product_id)).execute()
+                    supabase.table("transaksi_item").delete().eq("transaksi_id", transaction_id).eq("produk_id", created_product_id).execute()
                 supabase.table("transaksi").delete().eq("transaksi_id", transaction_id).execute()
                 return False, f"Gagal update stok: {message}", None
             
+            stock_updated.append(item['product_id'])
+            
             # Step 5: Log stock movement to audit trail
             log_stock_movement(
-                product_id=int(item['product_id']),
-                quantity_change=-int(item['quantity']),
+                product_id=item['product_id'],
+                quantity_change=-item['quantity'],  # Negative for sales
                 action_type="Penjualan",
                 notes=f"Transaksi: {transaction_id}"
             )
         
+        # Invalidate caches to ensure fresh data
         invalidate_cache('products')
         invalidate_cache('transactions')
         
         return True, "Transaksi berhasil diproses", transaction_id
         
     except Exception as e:
+        # Rollback any partial changes if possible
         if transaction_id:
             try:
+                # Delete created transaction items
                 supabase.table("transaksi_item").delete().eq("transaksi_id", transaction_id).execute()
+                # Delete transaction header
                 supabase.table("transaksi").delete().eq("transaksi_id", transaction_id).execute()
             except:
                 pass
+        
         return False, f"Transaksi gagal: {str(e)}", None
 
 # ============================================================================
