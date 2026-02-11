@@ -371,10 +371,10 @@ def create_product(name: str, price: float, stock: int, category: str) -> Tuple[
     """Create new product in database"""
     try:
         product_data = {
-            "nama_produk": name,
-            "harga": price,
-            "stok": stock,
-            "kategori": category
+            "nama_produk": str(name),
+            "harga": float(price),
+            "stok": int(stock),
+            "kategori": str(category)
         }
         supabase.table("produk").insert(product_data).execute()
         invalidate_cache('products')
@@ -386,12 +386,12 @@ def update_product(product_id: int, name: str, price: float, stock: int, categor
     """Update existing product in database"""
     try:
         update_data = {
-            "nama_produk": name,
-            "harga": price,
-            "stok": stock,
-            "kategori": category
+            "nama_produk": str(name),
+            "harga": float(price),
+            "stok": int(stock),
+            "kategori": str(category)
         }
-        supabase.table("produk").update(update_data).eq("produk_id", product_id).execute()
+        supabase.table("produk").update(update_data).eq("produk_id", int(product_id)).execute()
         invalidate_cache('products')
         return True, "Produk berhasil diperbarui"
     except Exception as e:
@@ -449,10 +449,10 @@ def log_stock_movement(product_id: int, quantity_change: int, action_type: str, 
     """
     try:
         log_data = {
-            "produk_id": product_id,
-            "jumlah_perubahan": quantity_change,
-            "tipe_aksi": action_type,
-            "keterangan": notes,
+            "produk_id": int(product_id),  # Ensure native Python int
+            "jumlah_perubahan": int(quantity_change),  # Ensure native Python int
+            "tipe_aksi": str(action_type),  # Ensure string
+            "keterangan": str(notes),  # Ensure string
             "waktu": get_current_datetime().isoformat()
         }
         supabase.table("stok_log").insert(log_data).execute()
@@ -518,8 +518,8 @@ def process_transaction(customer_id: str, total_amount: float, items: List[Dict]
         transaction_data = {
             "transaksi_id": transaction_id,
             "pelanggan_id": customer_id,
-            "total_bayar": total_amount,
-            "diskon": discount,
+            "total_bayar": float(total_amount),  # Convert to native Python float
+            "diskon": float(discount),  # Convert to native Python float
             "tanggal_transaksi": get_current_datetime().isoformat()
         }
         supabase.table("transaksi").insert(transaction_data).execute()
@@ -528,17 +528,17 @@ def process_transaction(customer_id: str, total_amount: float, items: List[Dict]
         for item in items:
             item_data = {
                 "transaksi_id": transaction_id,
-                "produk_id": item['product_id'],
-                "nama_produk": item['product_name'],  # Snapshot of product name
-                "harga_satuan": item['price'],  # PRICE SNAPSHOT - critical for historical accuracy
-                "jumlah": item['quantity'],
-                "subtotal": item['price'] * item['quantity']
+                "produk_id": int(item['product_id']),  # Convert to native Python int
+                "nama_produk": str(item['product_name']),  # Ensure string
+                "harga_satuan": float(item['price']),  # Convert to native Python float
+                "jumlah": int(item['quantity']),  # Convert to native Python int
+                "subtotal": float(item['price'] * item['quantity'])  # Convert to native Python float
             }
             supabase.table("transaksi_item").insert(item_data).execute()
             items_created.append(item['product_id'])
             
             # Step 4: Perform ATOMIC stock update (prevents race conditions)
-            success, message = atomic_stock_update(item['product_id'], item['quantity'])
+            success, message = atomic_stock_update(int(item['product_id']), int(item['quantity']))
             if not success:
                 # Rollback: delete transaction items and header
                 for created_product_id in items_created:
@@ -550,8 +550,8 @@ def process_transaction(customer_id: str, total_amount: float, items: List[Dict]
             
             # Step 5: Log stock movement to audit trail
             log_stock_movement(
-                product_id=item['product_id'],
-                quantity_change=-item['quantity'],  # Negative for sales
+                product_id=int(item['product_id']),  # Convert to native Python int
+                quantity_change=-int(item['quantity']),  # Negative for sales, convert to int
                 action_type="Penjualan",
                 notes=f"Transaksi: {transaction_id}"
             )
