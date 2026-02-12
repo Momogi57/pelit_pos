@@ -486,90 +486,159 @@ def atomic_stock_update(product_id: int, quantity_to_deduct: int) -> Tuple[bool,
     except Exception as e:
         return False, f"Gagal update stok: {str(e)}"
 
-def process_transaction(customer_id: str, total_amount: float, items: List[Dict], discount: float = 0) -> Tuple[bool, str, Optional[str]]:
+def process_transaction(customer_id: str, total_amount: float, items: List[Dict], discount: float = 0, 
+                       new_customer_name: Optional[str] = None, new_customer_email: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """
     Process transaction with normalized database structure and price snapshots
+    NOW SUPPORTS instant customer registration!
+    
     Implements transaction-like behavior: all or nothing
     Steps:
+    0. If customer_id == "NEW_CUST", register new customer first
     1. Validate stock availability
     2. Create transaction header
     3. Create transaction items with price snapshots
     4. Perform atomic stock updates
     5. Log stock movements
+    
+    Args:
+        customer_id: Customer ID or "NEW_CUST" for new customer
+        total_amount: Total payment amount
+        items: List of cart items
+        discount: Discount amount (default 0)
+        new_customer_name: Name for new customer (required if customer_id == "NEW_CUST")
+        new_customer_email: Email for new customer (optional)
+    
+    Returns:
+        (success: bool, message: str, transaction_id: Optional[str])
     """
     transaction_id = None
     items_created = []
-    stock_updated = []
+    actual_customer_id = customer_id
+    new_customer_created = False
     
     try:
-        # Step 1: Validate stock availability for ALL items first
+        # ===== STEP 0: Create New Customer if Needed =====
+        if customer_id == "NEW_CUST":
+            if not new_customer_name or not new_customer_name.strip():
+                return False, "Nama pelanggan baru harus diisi", None
+            
+            # Generate unique customer ID
+            actual_customer_id = generate_unique_id("CUST")
+            
+            # Create customer record
+            customer_data = {
+                "pelanggan_id": str(actual_customer_id),
+                "nama_pelanggan": str(new_customer_name).strip(),
+                "email": str(new_customer_email).strip() if new_customer_email else ""
+            }
+            
+            try:
+                supabase.table("pelanggan").insert(customer_data).execute()
+                new_customer_created = True
+                invalidate_cache('customers')  # Refresh customer cache
+            except Exception as e:
+                return False, f"Gagal mendaftarkan pelanggan baru: {str(e)}", None
+        
+        # ===== STEP 1: Validate stock availability for ALL items first =====
         products_df = fetch_products()
         for item in items:
             product_row = products_df[products_df['produk_id'] == item['product_id']]
             if product_row.empty:
+                # Rollback customer creation if product validation fails
+                if new_customer_created:
+                    try:
+                        supabase.table("pelanggan").delete().eq("pelanggan_id", actual_customer_id).execute()
+                    except:
+                        pass
                 return False, f"Produk {item['product_name']} tidak ditemukan", None
             
             current_stock = int(product_row.iloc[0]['stok'])
             if current_stock < item['quantity']:
+                # Rollback customer creation if stock validation fails
+                if new_customer_created:
+                    try:
+                        supabase.table("pelanggan").delete().eq("pelanggan_id", actual_customer_id).execute()
+                    except:
+                        pass
                 return False, f"Stok tidak mencukupi untuk {item['product_name']} (Tersedia: {current_stock})", None
         
-        # Step 2: Create transaction header
+        # ===== STEP 2: Create transaction header =====
         transaction_id = generate_unique_id("TRX")
         transaction_data = {
-            "transaksi_id": transaction_id,
-            "pelanggan_id": customer_id,
-            "total_bayar": float(total_amount),  # Convert to native Python float
-            "diskon": float(discount),  # Convert to native Python float
+            "transaksi_id": str(transaction_id),
+            "pelanggan_id": str(actual_customer_id),  # Use actual customer ID (new or existing)
+            "total_bayar": float(total_amount),
+            "diskon": float(discount),
             "tanggal_transaksi": get_current_datetime().isoformat()
         }
         supabase.table("transaksi").insert(transaction_data).execute()
         
-        # Step 3: Create transaction items with PRICE SNAPSHOTS
+        # ===== STEP 3: Create transaction items with PRICE SNAPSHOTS =====
         for item in items:
             item_data = {
-                "transaksi_id": transaction_id,
-                "produk_id": int(item['product_id']),  # Convert to native Python int
-                "nama_produk": str(item['product_name']),  # Ensure string
-                "harga_satuan": float(item['price']),  # Convert to native Python float
-                "jumlah": int(item['quantity']),  # Convert to native Python int
-                "subtotal": float(item['price'] * item['quantity'])  # Convert to native Python float
+                "transaksi_id": str(transaction_id),
+                "produk_id": int(item['product_id']),
+                "nama_produk": str(item['product_name']),
+                "harga_satuan": float(item['price']),  # PRICE SNAPSHOT
+                "jumlah": int(item['quantity']),
+                "subtotal": float(item['price'] * item['quantity'])
             }
             supabase.table("transaksi_item").insert(item_data).execute()
             items_created.append(item['product_id'])
             
-            # Step 4: Perform ATOMIC stock update (prevents race conditions)
+            # ===== STEP 4: Perform ATOMIC stock update (prevents race conditions) =====
             success, message = atomic_stock_update(int(item['product_id']), int(item['quantity']))
             if not success:
-                # Rollback: delete transaction items and header
+                # ROLLBACK: Delete transaction items, header, and new customer if created
                 for created_product_id in items_created:
                     supabase.table("transaksi_item").delete().eq("transaksi_id", transaction_id).eq("produk_id", created_product_id).execute()
                 supabase.table("transaksi").delete().eq("transaksi_id", transaction_id).execute()
+                
+                if new_customer_created:
+                    try:
+                        supabase.table("pelanggan").delete().eq("pelanggan_id", actual_customer_id).execute()
+                    except:
+                        pass
+                
                 return False, f"Gagal update stok: {message}", None
             
-            stock_updated.append(item['product_id'])
-            
-            # Step 5: Log stock movement to audit trail
+            # ===== STEP 5: Log stock movement to audit trail =====
             log_stock_movement(
-                product_id=int(item['product_id']),  # Convert to native Python int
-                quantity_change=-int(item['quantity']),  # Negative for sales, convert to int
+                product_id=int(item['product_id']),
+                quantity_change=-int(item['quantity']),  # Negative for sales
                 action_type="Penjualan",
                 notes=f"Transaksi: {transaction_id}"
             )
         
-        # Invalidate caches to ensure fresh data
+        # ===== SUCCESS: Invalidate caches to ensure fresh data =====
         invalidate_cache('products')
         invalidate_cache('transactions')
+        if new_customer_created:
+            invalidate_cache('customers')
         
-        return True, "Transaksi berhasil diproses", transaction_id
+        # Build success message
+        success_message = "Transaksi berhasil diproses"
+        if new_customer_created:
+            success_message += f" (Pelanggan baru '{new_customer_name}' berhasil didaftarkan)"
+        
+        return True, success_message, transaction_id
         
     except Exception as e:
-        # Rollback any partial changes if possible
+        # ===== ROLLBACK: Clean up any partial changes =====
         if transaction_id:
             try:
                 # Delete created transaction items
                 supabase.table("transaksi_item").delete().eq("transaksi_id", transaction_id).execute()
                 # Delete transaction header
                 supabase.table("transaksi").delete().eq("transaksi_id", transaction_id).execute()
+            except:
+                pass
+        
+        # Rollback new customer if created
+        if new_customer_created and actual_customer_id:
+            try:
+                supabase.table("pelanggan").delete().eq("pelanggan_id", actual_customer_id).execute()
             except:
                 pass
         
@@ -749,14 +818,14 @@ def render_top_nav():
 # ============================================================================
 
 def render_cashier_page():
-    """Render cashier terminal for transaction processing"""
+    """Render cashier terminal for transaction processing with instant customer registration"""
     render_page_header("shopping_cart", "Terminal Kasir", "Proses transaksi penjualan")
     
     products_df = fetch_products()
     customers_df = fetch_customers()
     
-    if products_df.empty or customers_df.empty:
-        st.warning("⚠️ Data master belum lengkap. Silakan tambahkan produk dan pelanggan terlebih dahulu.")
+    if products_df.empty:
+        st.warning("⚠️ Data produk belum ada. Silakan tambahkan produk terlebih dahulu.")
         return
     
     col_cart, col_receipt = st.columns([2, 1])
@@ -764,21 +833,88 @@ def render_cashier_page():
     with col_cart:
         st.subheader("Keranjang Belanja")
         
-        # Customer selection
-        customer_names = customers_df['nama_pelanggan'].tolist()
-        selected_customer_name = st.selectbox("Pilih Pelanggan", options=customer_names)
+        # ===== CUSTOMER SELECTION - NEW WORKFLOW =====
+        st.markdown("#### 👤 Informasi Pelanggan")
         
-        selected_customer = customers_df[customers_df['nama_pelanggan'] == selected_customer_name].iloc[0]
-        customer_id = selected_customer['pelanggan_id']
+        # Checkbox untuk pelanggan baru
+        is_new_customer = st.checkbox("🆕 Pelanggan Baru / Tidak Terdaftar?", key="new_customer_checkbox")
+        
+        # Initialize variables
+        new_customer_name = None
+        new_customer_email = None
+        
+        if is_new_customer:
+            # Input untuk pelanggan baru
+            new_customer_name = st.text_input(
+                "Nama Pelanggan Baru",
+                placeholder="Masukkan nama pelanggan...",
+                key="new_customer_name_input"
+            )
+            new_customer_email = st.text_input(
+                "Email Pelanggan (Opsional)",
+                placeholder="email@contoh.com",
+                key="new_customer_email_input"
+            )
+            
+            # Set untuk proses transaksi
+            customer_id = "NEW_CUST"
+            selected_customer_name = new_customer_name if new_customer_name.strip() else "Pelanggan Baru"
+            
+            # Validasi nama pelanggan baru
+            if not new_customer_name.strip():
+                st.warning("⚠️ Silakan isi nama pelanggan baru")
+        else:
+            # Dropdown pelanggan existing dengan opsi Pelanggan Umum
+            if not customers_df.empty:
+                # Tambahkan opsi "Pelanggan Umum" di awal list
+                customer_options = ["Pelanggan Umum"] + customers_df['nama_pelanggan'].tolist()
+                selected_customer_name = st.selectbox(
+                    "Pilih Pelanggan",
+                    options=customer_options,
+                    key="existing_customer_select"
+                )
+                
+                # Get customer ID
+                if selected_customer_name == "Pelanggan Umum":
+                    # Cek apakah Pelanggan Umum sudah ada di database
+                    general_customer = customers_df[customers_df['nama_pelanggan'] == 'Pelanggan Umum']
+                    if not general_customer.empty:
+                        customer_id = general_customer.iloc[0]['pelanggan_id']
+                    else:
+                        # Jika belum ada, tandai untuk dibuat
+                        customer_id = "NEW_CUST"
+                        new_customer_name = "Pelanggan Umum"
+                        new_customer_email = "umum@pelitpos.com"
+                else:
+                    selected_customer = customers_df[customers_df['nama_pelanggan'] == selected_customer_name].iloc[0]
+                    customer_id = selected_customer['pelanggan_id']
+            else:
+                # Jika belum ada pelanggan sama sekali
+                st.info("ℹ️ Belum ada data pelanggan. Silakan isi nama pelanggan baru di bawah.")
+                new_customer_name = st.text_input(
+                    "Nama Pelanggan",
+                    placeholder="Masukkan nama pelanggan...",
+                    value="Pelanggan Umum",
+                    key="first_customer_name"
+                )
+                new_customer_email = st.text_input(
+                    "Email (Opsional)",
+                    placeholder="email@contoh.com",
+                    value="umum@pelitpos.com",
+                    key="first_customer_email"
+                )
+                customer_id = "NEW_CUST"
+                selected_customer_name = new_customer_name
         
         st.markdown("---")
         
-        # Product selection
+        # ===== PRODUCT SELECTION =====
+        st.markdown("#### 🛒 Tambah Produk")
         col_prod, col_qty = st.columns([3, 1])
         
         with col_prod:
             product_names = products_df['nama_produk'].tolist()
-            selected_product_name = st.selectbox("Pilih Produk", options=product_names)
+            selected_product_name = st.selectbox("Pilih Produk", options=product_names, key="product_select")
         
         selected_product = products_df[products_df['nama_produk'] == selected_product_name].iloc[0]
         
@@ -786,13 +922,15 @@ def render_cashier_page():
         product_price = float(selected_product['harga'])
         
         with col_qty:
-            quantity = st.number_input("Jumlah", min_value=1, max_value=max_qty if max_qty > 0 else 1, value=1)
+            quantity = st.number_input("Jumlah", min_value=1, max_value=max_qty if max_qty > 0 else 1, value=1, key="qty_input")
         
+        # Stock warnings
         if max_qty == 0:
             st.error(f"❌ Stok {selected_product_name} habis!")
         elif max_qty < 5:
             st.warning(f"⚠️ Stok {selected_product_name} tersisa {max_qty} unit")
         
+        # Add to cart button
         if st.button("➕ Tambah ke Keranjang", use_container_width=True, disabled=(max_qty == 0)):
             cart_item = {
                 'product_id': selected_product['produk_id'],
@@ -806,7 +944,7 @@ def render_cashier_page():
         
         st.markdown("---")
         
-        # Display cart
+        # ===== CART DISPLAY =====
         if st.session_state.cart_items:
             st.subheader("Item Keranjang")
             
@@ -834,6 +972,7 @@ def render_cashier_page():
         else:
             st.info("Keranjang kosong. Tambahkan produk untuk memulai transaksi.")
     
+    # ===== RECEIPT PANEL =====
     with col_receipt:
         st.subheader("Struk Belanja")
         
@@ -846,7 +985,8 @@ def render_cashier_page():
                 min_value=0.0,
                 max_value=float(subtotal),
                 value=0.0,
-                step=1000.0
+                step=1000.0,
+                key="discount_input"
             )
             
             grand_total = subtotal + tax_amount - discount_amount
@@ -862,19 +1002,38 @@ def render_cashier_page():
             
             st.markdown("---")
             
-            if st.button("💳 PROSES PEMBAYARAN", use_container_width=True, type="primary"):
+            # Payment button - with validation for new customer
+            can_process = True
+            if is_new_customer and (not new_customer_name or not new_customer_name.strip()):
+                can_process = False
+                st.error("❌ Nama pelanggan baru harus diisi!")
+            
+            if st.button("💳 PROSES PEMBAYARAN", use_container_width=True, type="primary", disabled=not can_process):
                 with st.spinner("Memproses transaksi..."):
-                    success, message, transaction_id = process_transaction(
-                        customer_id=customer_id,
-                        total_amount=grand_total,
-                        items=st.session_state.cart_items,
-                        discount=discount_amount
-                    )
+                    # Prepare data for new customer if needed
+                    if customer_id == "NEW_CUST":
+                        success, message, transaction_id = process_transaction(
+                            customer_id=customer_id,
+                            total_amount=grand_total,
+                            items=st.session_state.cart_items,
+                            discount=discount_amount,
+                            new_customer_name=str(new_customer_name).strip() if new_customer_name else "",
+                            new_customer_email=str(new_customer_email).strip() if new_customer_email else ""
+                        )
+                    else:
+                        success, message, transaction_id = process_transaction(
+                            customer_id=customer_id,
+                            total_amount=grand_total,
+                            items=st.session_state.cart_items,
+                            discount=discount_amount
+                        )
                     
                     if success:
                         st.success(f"✓ {message}")
                         st.info(f"ID Transaksi: **{transaction_id}**")
                         st.session_state.cart_items = []
+                        # Invalidate customer cache to show new customer
+                        invalidate_cache('customers')
                         time.sleep(1)
                         st.balloons()
                         st.rerun()
