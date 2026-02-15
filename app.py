@@ -722,11 +722,16 @@ def render_sidebar_nav():
         
         for page, icon in pages.items():
             is_active = st.session_state.current_page == page
-            button_type = "primary" if is_active else "secondary"
             
-            if st.button(f"{icon} {page}", key=f"nav_{page}", use_container_width=True, type=button_type if is_active else None):
-                st.session_state.current_page = page
-                st.rerun()
+            # Use type parameter only when active
+            if is_active:
+                if st.button(f"{icon} {page}", key=f"nav_{page}", use_container_width=True, type="primary"):
+                    st.session_state.current_page = page
+                    st.rerun()
+            else:
+                if st.button(f"{icon} {page}", key=f"nav_{page}", use_container_width=True):
+                    st.session_state.current_page = page
+                    st.rerun()
         
         st.markdown("---")
         
