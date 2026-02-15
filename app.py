@@ -24,6 +24,7 @@ import plotly.graph_objects as go
 from typing import Dict, List, Optional, Tuple
 import time
 import hashlib
+import textwrap
 
 # ============================================================================
 # PAGE CONFIGURATION
