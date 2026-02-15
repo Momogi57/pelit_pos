@@ -627,80 +627,65 @@ def process_transaction(customer_id, total_amount, items, discount=0,
 # ============================================================================
 
 def render_receipt(items, subtotal, tax, discount, total, transaction_id=None, customer_name=None):
-    """Render print-friendly receipt with PPN breakdown"""
+    """Render print-friendly receipt (FIXED: Anti-Leak HTML)"""
     current_time = get_current_datetime()
     
-    # Build items HTML
-    items_html = ""
+    # 1. Header Struk
+    html = textwrap.dedent(f"""
+        <div class="receipt-container" style="background:{COLORS['bg_secondary']}; border:2px solid {COLORS['border']}; border-radius:12px; padding:28px; font-family:'Courier New', monospace;">
+            <div style="text-align:center; border-bottom:2px dashed {COLORS['border']}; padding-bottom:20px; margin-bottom:20px;">
+                <h2 style="margin:0; color:{COLORS['text_primary']};">💡 PelitPos</h2>
+                <p style="margin:5px 0; color:{COLORS['text_muted']}; font-size:12px;">gk medit gk sugeh ta?</p>
+            </div>
+            <div style="margin:16px 0; font-size:12px; color:{COLORS['text_muted']};">
+                <div style="display:flex; justify-content:space-between;"><span>Invoice:</span><span style="color:{COLORS['text_primary']}; font-weight:600;">{transaction_id or 'PREVIEW'}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Date:</span><span>{current_time.strftime('%d %b %Y, %H:%M')}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Customer:</span><span>{customer_name or 'Guest'}</span></div>
+            </div>
+            <div style="border-top:2px dashed {COLORS['border']}; margin:16px 0;"></div>
+            <h4 style="margin:10px 0; color:{COLORS['text_primary']};">Items:</h4>
+    """).strip()
+
+    # 2. Baris Item (Looping)
     for item in items:
         item_total = item['quantity'] * item['price']
-        items_html += f"""
-        <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:13px;border-bottom:1px dotted {COLORS['border']};">
-            <div>
-                <div style="color:{COLORS['text_primary']};font-weight:500;">{item['product_name']}</div>
-                <div style="color:{COLORS['text_muted']};font-size:11px;">{item['quantity']} x {format_currency(item['price'])}</div>
+        html += textwrap.dedent(f"""
+            <div style="display:flex; justify-content:space-between; padding:8px 0; font-size:13px; border-bottom:1px dotted {COLORS['border']};">
+                <div>
+                    <div style="color:{COLORS['text_primary']}; font-weight:500;">{item['product_name']}</div>
+                    <div style="color:{COLORS['text_muted']}; font-size:11px;">{item['quantity']} x {format_currency(item['price'])}</div>
+                </div>
+                <div style="color:{COLORS['text_primary']}; font-weight:600;">{format_currency(item_total)}</div>
             </div>
-            <div style="color:{COLORS['text_primary']};font-weight:600;">{format_currency(item_total)}</div>
-        </div>
-        """
-    
-    # Complete receipt HTML
-    receipt_html = f"""
-    <div class="receipt-container" id="receipt-to-print" style="background:{COLORS['bg_secondary']};border:2px solid {COLORS['border']};border-radius:12px;padding:28px;font-family:'Courier New',monospace;box-shadow:0 4px 6px rgba(0,0,0,0.3);">
-        <div style="text-align:center;border-bottom:2px dashed {COLORS['border']};padding-bottom:20px;margin-bottom:20px;">
-            <h2 style="margin:0;color:{COLORS['text_primary']};">💡 PelitPos</h2>
-            <p style="margin:5px 0;color:{COLORS['text_muted']};font-size:12px;">gk medit gk sugeh ta?</p>
-            <p style="margin:0;color:{COLORS['text_muted']};font-size:11px;">Jl. Enterprise Boulevard No. 123</p>
-        </div>
-        
-        <div style="margin:16px 0;font-size:12px;color:{COLORS['text_muted']};">
-            <div style="display:flex;justify-content:space-between;margin:5px 0;">
-                <span>Invoice:</span>
-                <span style="color:{COLORS['text_primary']};font-weight:600;">{transaction_id or 'PREVIEW'}</span>
+        """).strip()
+
+    # 3. Footer Struk (Total & PPN)
+    html += textwrap.dedent(f"""
+            <div style="border-top:2px dashed {COLORS['border']}; margin:16px 0; padding-top:16px;">
+                <div style="display:flex; justify-content:space-between; margin:8px 0; font-size:14px;">
+                    <span style="color:{COLORS['text_secondary']};">Subtotal:</span>
+                    <span style="color:{COLORS['text_primary']};">{format_currency(subtotal)}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin:8px 0; font-size:14px;">
+                    <span style="color:{COLORS['text_secondary']};">PPN (11%):</span>
+                    <span style="color:{COLORS['text_primary']};">{format_currency(tax)}</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin:8px 0; font-size:14px;">
+                    <span style="color:{COLORS['text_secondary']};">Discount:</span>
+                    <span style="color:{COLORS['danger']};">-{format_currency(discount)}</span>
+                </div>
             </div>
-            <div style="display:flex;justify-content:space-between;margin:5px 0;">
-                <span>Date:</span>
-                <span>{current_time.strftime('%d %b %Y, %H:%M')}</span>
+            <div style="font-size:28px; font-weight:700; color:{COLORS['success']}; text-align:right; margin-top:20px; padding-top:20px; border-top:3px solid {COLORS['accent']};">
+                TOTAL: {format_currency(total)}
             </div>
-            <div style="display:flex;justify-content:space-between;margin:5px 0;">
-                <span>Customer:</span>
-                <span>{customer_name or 'Guest'}</span>
-            </div>
-        </div>
-        
-        <div style="border-top:2px dashed {COLORS['border']};margin:16px 0;"></div>
-        
-        <h4 style="margin:10px 0;color:{COLORS['text_primary']};">Items:</h4>
-        
-        {items_html}
-        
-        <div style="border-top:2px dashed {COLORS['border']};margin:16px 0;padding-top:16px;">
-            <div style="display:flex;justify-content:space-between;margin:8px 0;font-size:14px;">
-                <span style="color:{COLORS['text_secondary']};">Subtotal:</span>
-                <span style="color:{COLORS['text_primary']};">{format_currency(subtotal)}</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:8px 0;font-size:14px;">
-                <span style="color:{COLORS['text_secondary']};">PPN (11%):</span>
-                <span style="color:{COLORS['text_primary']};">{format_currency(tax)}</span>
-            </div>
-            <div style="display:flex;justify-content:space-between;margin:8px 0;font-size:14px;">
-                <span style="color:{COLORS['text_secondary']};">Discount:</span>
-                <span style="color:{COLORS['danger']};">-{format_currency(discount)}</span>
+            <div style="text-align:center; margin-top:20px; padding-top:20px; border-top:1px dashed {COLORS['border']}; color:{COLORS['text_muted']}; font-size:11px;">
+                Thank you for your purchase!<br>Semoga berkah dan sukses selalu 🙏
             </div>
         </div>
-        
-        <div style="font-size:28px;font-weight:700;color:{COLORS['success']};text-align:right;margin-top:20px;padding-top:20px;border-top:3px solid {COLORS['accent']};letter-spacing:-1px;">
-            TOTAL: {format_currency(total)}
-        </div>
-        
-        <div style="text-align:center;margin-top:20px;padding-top:20px;border-top:1px dashed {COLORS['border']};color:{COLORS['text_muted']};font-size:11px;">
-            Thank you for your purchase!<br>
-            Semoga berkah dan sukses selalu 🙏
-        </div>
-    </div>
-    """
-    
-    st.markdown(receipt_html, unsafe_allow_html=True)
+    """).strip()
+
+    # 4. TAMPILKAN SEKALI SAJA
+    st.markdown(html, unsafe_allow_html=True)
 
 # ============================================================================
 # SIDEBAR NAVIGATION
