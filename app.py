@@ -198,19 +198,37 @@ def inject_enterprise_css():
         border-top: 3px solid {COLORS['accent']};
     }}
     
-    /* Print Styles */
-    @media print {{
-        body * {{ visibility: hidden; }}
-        .receipt-container, .receipt-container * {{ visibility: visible; }}
-        .receipt-container {{
-            position: absolute;
-            left: 0;
-            top: 0;
-            width: 80mm;
-            background: white;
-            color: black;
+	/* Print Styles - Optimal for Thermal Printers */
+	@media print {{
+        header, footer, section[data-testid="stSidebar"], 
+        .stButton, .stActionButton, [data-testid="stToolbar"],
+        .stChatMessage, .stToast {{
+            display: none !important;
         }}
-        .stButton {{ display: none; }}
+        @page {{
+            size: 58mm auto;
+            margin: 0;
+        }}
+        body {{
+            background: white !important;
+            color: black !important;
+            margin: 0;
+            padding: 0;
+        }}
+        .receipt-container {{
+            visibility: visible !important;
+            display: block !important;
+            width: 100% !important;
+            background: white !important;
+            color: black !important;
+            padding: 2mm !important;
+            border: none !important;
+            font-family: 'Courier New', Courier, monospace;
+        }}
+        .receipt-container * {{
+            color: black !important;
+            background: transparent !important;
+        }}
     }}
     
     /* Sidebar Nav */
@@ -316,8 +334,9 @@ def render_page_header(title: str, subtitle: str = None):
 # ============================================================================
 
 def trigger_print_receipt(transaction_id: str):
-    """Print receipt using window.print()"""
+    """Print receipt using hidden iframe to bypass popup blockers"""
     try:
+        # 1. Fetch Data dari Supabase (Sesuai Logic lo)
         trans_data = supabase.table("transaksi").select("*, pelanggan(nama_pelanggan)").eq("transaksi_id", transaction_id).execute()
         items_data = supabase.table("transaksi_item").select("*").eq("transaksi_id", transaction_id).execute()
         
@@ -327,52 +346,73 @@ def trigger_print_receipt(transaction_id: str):
         
         trans = trans_data.data[0]
         items = items_data.data
-        
         customer_name = trans.get('pelanggan', {}).get('nama_pelanggan', 'Guest') if isinstance(trans.get('pelanggan'), dict) else 'Guest'
         
+        # 2. Build HTML Items (Tanpa Indentasi biar aman)
         items_html = ""
         for item in items:
             items_html += f"<div style='display:flex;justify-content:space-between;margin:5px 0;'><span>{item['nama_produk']} x{item['jumlah']}</span><span>{format_currency(item['subtotal'])}</span></div>"
         
-        receipt_html = f"""
-        <div style="width:80mm;font-family:'Courier New',monospace;font-size:12px;padding:10mm;">
-            <div style="text-align:center;margin-bottom:10px;">
-                <h2 style="margin:0;">💡 PelitPos</h2>
-                <p style="margin:0;font-size:10px;">gk medit gk sugeh ta?</p>
+        # 3. Build Main Receipt HTML (Pakai textwrap agar mepet kiri)
+        # Kita set lebar 58mm agar pas di printer thermal bluetooth
+        receipt_content = textwrap.dedent(f"""
+            <div style="width:58mm; font-family:'Courier New',monospace; font-size:12px; padding:2mm; color:black; background:white;">
+                <div style="text-align:center; margin-bottom:10px;">
+                    <h2 style="margin:0;">💡 PelitPos</h2>
+                    <p style="margin:0; font-size:10px;">gk medit gk sugeh ta?</p>
+                </div>
+                <hr style="border-top:1px dashed black;">
+                <div style="margin:10px 0; font-size:11px;">
+                    <p style="margin:2px 0;">ID: {trans['transaksi_id']}</p>
+                    <p style="margin:2px 0;">Tgl: {trans['tanggal_transaksi']}</p>
+                    <p style="margin:2px 0;">Plg: {customer_name}</p>
+                </div>
+                <hr style="border-top:1px dashed black;">
+                {items_html}
+                <hr style="border-top:1px dashed black;">
+                <div style="margin:10px 0; font-size:11px;">
+                    <div style="display:flex;justify-content:space-between;"><span>Subtotal:</span><span>{format_currency(trans.get('subtotal', 0))}</span></div>
+                    <div style="display:flex;justify-content:space-between;"><span>PPN 11%:</span><span>{format_currency(trans.get('ppn', 0))}</span></div>
+                    <div style="display:flex;justify-content:space-between;color:red;"><span>Diskon:</span><span>-{format_currency(trans.get('diskon', 0))}</span></div>
+                </div>
+                <hr style="border-top:1px dashed black;">
+                <div style="text-align:right; font-size:14px; font-weight:bold; margin:10px 0;">
+                    TOTAL: {format_currency(trans['total_bayar'])}
+                </div>
+                <hr style="border-top:1px dashed black;">
+                <p style="text-align:center; font-size:10px; margin-top:10px;">*** TERIMA KASIH ***<br>Semoga berkah & sukses selalu</p>
             </div>
-            <hr>
-            <div style="margin:10px 0;">
-                <p style="margin:2px 0;">Invoice: {trans['transaksi_id']}</p>
-                <p style="margin:2px 0;">Date: {trans['tanggal_transaksi']}</p>
-                <p style="margin:2px 0;">Customer: {customer_name}</p>
-            </div>
-            <hr>
-            {items_html}
-            <hr>
-            <div style="margin:10px 0;">
-                <div style="display:flex;justify-content:space-between;"><span>Subtotal:</span><span>{format_currency(trans.get('subtotal', 0))}</span></div>
-                <div style="display:flex;justify-content:space-between;"><span>PPN 11%:</span><span>{format_currency(trans.get('ppn', 0))}</span></div>
-                <div style="display:flex;justify-content:space-between;"><span>Discount:</span><span>-{format_currency(trans.get('diskon', 0))}</span></div>
-            </div>
-            <hr>
-            <div style="text-align:right;font-size:16px;font-weight:bold;margin:10px 0;">
-                TOTAL: {format_currency(trans['total_bayar'])}
-            </div>
-            <hr>
-            <p style="text-align:center;font-size:10px;margin-top:10px;">Thank you!</p>
-        </div>
-        """.replace("'", "\\'").replace("\n", "")
-        
+        """).strip().replace("'", "\\'").replace("\n", " ")
+
+        # 4. JavaScript Iframe (Anti-Pop-up Logic)
         print_js = f"""
         <script>
-        (function() {{
-            var w = window.open('', '', 'width=400,height=600');
-            w.document.write('<html><head><title>Receipt</title>');
-            w.document.write('<style>body{{margin:0;padding:10px;}}</style>');
-            w.document.write('</head><body>{receipt_html}</body></html>');
-            w.document.close();
-            setTimeout(function(){{w.print();}}, 250);
-        }})();
+            (function() {{
+                var oldFrame = document.getElementById('printFrame');
+                if (oldFrame) oldFrame.remove();
+
+                var iframe = document.createElement('iframe');
+                iframe.id = 'printFrame';
+                iframe.style.position = 'fixed';
+                iframe.style.bottom = '0';
+                iframe.style.right = '0';
+                iframe.style.width = '0';
+                iframe.style.height = '0';
+                iframe.style.border = 'none';
+                document.body.appendChild(iframe);
+
+                var doc = iframe.contentWindow.document;
+                doc.open();
+                doc.write('<html><head><title>Print Receipt</title>');
+                doc.write('<style>@page {{ size: 58mm auto; margin: 0; }} body {{ margin: 0; padding: 0; }}</style>');
+                doc.write('</head><body>{receipt_content}</body></html>');
+                doc.close();
+
+                setTimeout(function() {{
+                    iframe.contentWindow.focus();
+                    iframe.contentWindow.print();
+                }}, 500);
+            }})();
         </script>
         """
         
@@ -900,6 +940,7 @@ def render_cashier_page():
             
             if st.button("💳 PROCESS PAYMENT", use_container_width=True, type="primary", disabled=not can_process):
                 with st.spinner("Processing transaction..."):
+                    # 1. Jalankan Proses Database
                     if customer_id == "NEW_CUST":
                         success, message, transaction_id = process_transaction(
                             customer_id=customer_id,
@@ -921,14 +962,32 @@ def render_cashier_page():
                         st.success(f"✓ {message}")
                         st.info(f"Transaction ID: **{transaction_id}**")
                         
-                        # Auto-print receipt
-                        if st.checkbox("🖨️ Print Receipt", value=True, key="auto_print"):
-                            trigger_print_receipt(transaction_id)
+                        # Tentukan nama pelanggan untuk ditampilkan di struk
+                        disp_name = new_customer_name if customer_id == "NEW_CUST" else "Guest"
                         
+                        # 2. Render Struk di Layar dan Ambil HTML-nya untuk Print
+                        # Pastikan variabel subtotal, tax_amount, discount_amount, grand_total sudah dihitung di atas
+                        struk_html = render_receipt(
+                            items=st.session_state.cart_items,
+                            subtotal=subtotal, 
+                            tax=tax_amount, 
+                            discount=discount_amount, 
+                            total=grand_total,
+                            transaction_id=transaction_id,
+                            customer_name=disp_name
+                        )
+                        
+                        # 3. Logika Auto-print menggunakan Iframe (Kirim HTML struk_html)
+                        if st.checkbox("🖨️ Print Receipt", value=True, key="auto_print"):
+                            trigger_print_receipt(struk_html)
+                        
+                        # 4. Cleanup & Reset State
                         st.session_state.cart_items = []
                         invalidate_cache('customers')
-                        time.sleep(2)
+                        
                         st.balloons()
+                        # Beri jeda 3 detik agar Iframe sempat memicu dialog print sebelum halaman refresh
+                        time.sleep(3)
                         st.rerun()
                     else:
                         st.error(f"❌ {message}")
