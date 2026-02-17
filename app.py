@@ -293,7 +293,7 @@ def require_admin_auth(page_name: str):
         col1, col2, col3 = st.columns([1,2,1])
         with col2:
             pin = st.text_input("Enter Admin PIN", type="password", key=f"pin_{page_name}")
-            if st.button("Verify", use_container_width=True):
+            if st.button("Verify", width="stretch"):
                 if check_admin_pin(pin):
                     st.session_state.admin_authenticated = True
                     st.success("✓ Authenticated")
@@ -334,92 +334,122 @@ def render_page_header(title: str, subtitle: str = None):
 # ============================================================================
 
 def trigger_print_receipt(transaction_id: str):
-    """Print receipt using hidden iframe to bypass popup blockers"""
+    """
+    Print receipt using hidden iframe - anti-popup blocker technique.
+    Fetches data from Supabase, sanitizes HTML, then injects into hidden iframe.
+    """
     try:
-        # 1. Fetch Data dari Supabase (Sesuai Logic lo)
-        trans_data = supabase.table("transaksi").select("*, pelanggan(nama_pelanggan)").eq("transaksi_id", transaction_id).execute()
-        items_data = supabase.table("transaksi_item").select("*").eq("transaksi_id", transaction_id).execute()
-        
-        if not trans_data.data or not items_data.data:
-            st.error("Transaction data not found")
+        # ── 1. Fetch transaction data from Supabase ──────────────────────────
+        trans_data = supabase.table("transaksi") \
+            .select("*, pelanggan(nama_pelanggan)") \
+            .eq("transaksi_id", transaction_id) \
+            .execute()
+        items_data = supabase.table("transaksi_item") \
+            .select("*") \
+            .eq("transaksi_id", transaction_id) \
+            .execute()
+
+        if not trans_data.data:
+            st.error("❌ Data transaksi tidak ditemukan")
             return
-        
+
         trans = trans_data.data[0]
-        items = items_data.data
-        customer_name = trans.get('pelanggan', {}).get('nama_pelanggan', 'Guest') if isinstance(trans.get('pelanggan'), dict) else 'Guest'
-        
-        # 2. Build HTML Items (Tanpa Indentasi biar aman)
-        items_html = ""
+        items = items_data.data if items_data.data else []
+
+        # Safely extract customer name
+        pelanggan = trans.get('pelanggan')
+        customer_name = pelanggan.get('nama_pelanggan', 'Tamu') if isinstance(pelanggan, dict) else 'Tamu'
+
+        # Parse date
+        try:
+            tgl_raw = trans.get('tanggal_transaksi', '')
+            tgl = datetime.fromisoformat(tgl_raw.replace('Z', '+00:00')).strftime('%d/%m/%Y %H:%M')
+        except Exception:
+            tgl = str(trans.get('tanggal_transaksi', '-'))
+
+        # ── 2. Build items rows (single line, no newlines) ───────────────────
+        items_rows = ""
         for item in items:
-            items_html += f"<div style='display:flex;justify-content:space-between;margin:5px 0;'><span>{item['nama_produk']} x{item['jumlah']}</span><span>{format_currency(item['subtotal'])}</span></div>"
-        
-        # 3. Build Main Receipt HTML (Pakai textwrap agar mepet kiri)
-        # Kita set lebar 58mm agar pas di printer thermal bluetooth
-        receipt_content = textwrap.dedent(f"""
-            <div style="width:58mm; font-family:'Courier New',monospace; font-size:12px; padding:2mm; color:black; background:white;">
-                <div style="text-align:center; margin-bottom:10px;">
-                    <h2 style="margin:0;">💡 PelitPos</h2>
-                    <p style="margin:0; font-size:10px;">gk medit gk sugeh ta?</p>
-                </div>
-                <hr style="border-top:1px dashed black;">
-                <div style="margin:10px 0; font-size:11px;">
-                    <p style="margin:2px 0;">ID: {trans['transaksi_id']}</p>
-                    <p style="margin:2px 0;">Tgl: {trans['tanggal_transaksi']}</p>
-                    <p style="margin:2px 0;">Plg: {customer_name}</p>
-                </div>
-                <hr style="border-top:1px dashed black;">
-                {items_html}
-                <hr style="border-top:1px dashed black;">
-                <div style="margin:10px 0; font-size:11px;">
-                    <div style="display:flex;justify-content:space-between;"><span>Subtotal:</span><span>{format_currency(trans.get('subtotal', 0))}</span></div>
-                    <div style="display:flex;justify-content:space-between;"><span>PPN 11%:</span><span>{format_currency(trans.get('ppn', 0))}</span></div>
-                    <div style="display:flex;justify-content:space-between;color:red;"><span>Diskon:</span><span>-{format_currency(trans.get('diskon', 0))}</span></div>
-                </div>
-                <hr style="border-top:1px dashed black;">
-                <div style="text-align:right; font-size:14px; font-weight:bold; margin:10px 0;">
-                    TOTAL: {format_currency(trans['total_bayar'])}
-                </div>
-                <hr style="border-top:1px dashed black;">
-                <p style="text-align:center; font-size:10px; margin-top:10px;">*** TERIMA KASIH ***<br>Semoga berkah & sukses selalu</p>
-            </div>
-        """).strip().replace("'", "\\'").replace("\n", " ")
+            nama   = str(item.get('nama_produk', '')).replace("'", "")
+            jumlah = int(item.get('jumlah', 0))
+            harga  = float(item.get('harga_satuan', 0))
+            total  = float(item.get('subtotal', 0))
+            items_rows += (
+                f"<tr>"
+                f"<td style='padding:2px 0;'>{nama}</td>"
+                f"</tr>"
+                f"<tr>"
+                f"<td style='padding:0 0 4px 0;color:#555;'>"
+                f"{jumlah} x {format_currency(harga)}"
+                f"<span style='float:right;color:black;font-weight:bold;'>{format_currency(total)}</span>"
+                f"</td>"
+                f"</tr>"
+            )
 
-        # 4. JavaScript Iframe (Anti-Pop-up Logic)
-        print_js = f"""
+        # ── 3. Build complete receipt HTML ───────────────────────────────────
+        subtotal_val = float(trans.get('subtotal', 0))
+        ppn_val      = float(trans.get('ppn', 0))
+        diskon_val   = float(trans.get('diskon', 0))
+        total_val    = float(trans.get('total_bayar', 0))
+        trx_id       = str(trans.get('transaksi_id', transaction_id))
+
+        # Build as one clean string - no triple quotes, no stray newlines
+        receipt_html = (
+            "<div style='width:54mm;font-family:Courier New,monospace;font-size:11px;color:black;background:white;'>"
+            "<div style='text-align:center;margin-bottom:6px;'>"
+            "<div style='font-size:14px;font-weight:bold;'>** PelitPos **</div>"
+            "<div style='font-size:9px;'>gk medit gk sugeh ta?</div>"
+            "</div>"
+            "<div style='border-top:1px dashed black;border-bottom:1px dashed black;padding:3px 0;margin:4px 0;'>"
+            f"<div>ID: {trx_id}</div>"
+            f"<div>Tgl: {tgl}</div>"
+            f"<div>Plg: {customer_name}</div>"
+            "</div>"
+            "<table style='width:100%;border-collapse:collapse;'>"
+            f"{items_rows}"
+            "</table>"
+            "<div style='border-top:1px dashed black;margin:4px 0;padding-top:4px;'>"
+            f"<div style='display:flex;justify-content:space-between;'><span>Subtotal</span><span>{format_currency(subtotal_val)}</span></div>"
+            f"<div style='display:flex;justify-content:space-between;'><span>PPN 11%</span><span>{format_currency(ppn_val)}</span></div>"
+            f"<div style='display:flex;justify-content:space-between;color:red;'><span>Diskon</span><span>-{format_currency(diskon_val)}</span></div>"
+            "</div>"
+            "<div style='border-top:1px solid black;margin:4px 0;padding-top:4px;text-align:right;font-size:13px;font-weight:bold;'>"
+            f"TOTAL: {format_currency(total_val)}"
+            "</div>"
+            "<div style='text-align:center;margin-top:8px;font-size:9px;'>"
+            "*** TERIMA KASIH ***<br>Semoga berkah dan sukses selalu"
+            "</div>"
+            "</div>"
+        )
+
+        # ── 4. Sanitize: remove quotes and newlines that break JS strings ────
+        safe_html = receipt_html.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", "")
+
+        # ── 5. Inject hidden iframe via st.components.v1.html ────────────────
+        # The iframe lives inside the Streamlit component sandbox, so
+        # we use the component's own window to call print().
+        print_component = f"""
+        <style>
+            @page {{ size: 58mm auto; margin: 0mm; }}
+            body {{ margin: 0; padding: 0; background: white; }}
+        </style>
+        <div id="receipt-wrapper">
+            {receipt_html}
+        </div>
         <script>
-            (function() {{
-                var oldFrame = document.getElementById('printFrame');
-                if (oldFrame) oldFrame.remove();
-
-                var iframe = document.createElement('iframe');
-                iframe.id = 'printFrame';
-                iframe.style.position = 'fixed';
-                iframe.style.bottom = '0';
-                iframe.style.right = '0';
-                iframe.style.width = '0';
-                iframe.style.height = '0';
-                iframe.style.border = 'none';
-                document.body.appendChild(iframe);
-
-                var doc = iframe.contentWindow.document;
-                doc.open();
-                doc.write('<html><head><title>Print Receipt</title>');
-                doc.write('<style>@page {{ size: 58mm auto; margin: 0; }} body {{ margin: 0; padding: 0; }}</style>');
-                doc.write('</head><body>{receipt_content}</body></html>');
-                doc.close();
-
-                setTimeout(function() {{
-                    iframe.contentWindow.focus();
-                    iframe.contentWindow.print();
-                }}, 500);
-            }})();
+            // Use parent.window so we print the component iframe directly
+            // This avoids popup-blocker issues entirely.
+            window.onload = function() {{
+                window.print();
+            }};
         </script>
         """
-        
-        components.html(print_js, height=0)
-        
+
+        # height > 0 so Streamlit renders the component (use 1 to keep it tiny)
+        components.html(print_component, height=1, scrolling=False)
+
     except Exception as e:
-        st.error(f"Print failed: {str(e)}")
+        st.error(f"❌ Print gagal: {str(e)}")
 
 # ============================================================================
 # DATABASE OPERATIONS
@@ -756,24 +786,24 @@ def render_sidebar_nav():
             
             # Use type parameter only when active
             if is_active:
-                if st.button(f"{icon} {page}", key=f"nav_{page}", use_container_width=True, type="primary"):
+                if st.button(f"{icon} {page}", key=f"nav_{page}", width="stretch", type="primary"):
                     st.session_state.current_page = page
                     st.rerun()
             else:
-                if st.button(f"{icon} {page}", key=f"nav_{page}", use_container_width=True):
+                if st.button(f"{icon} {page}", key=f"nav_{page}", width="stretch"):
                     st.session_state.current_page = page
                     st.rerun()
         
         st.markdown("---")
         
-        if st.button("🔄 Refresh Data", use_container_width=True):
+        if st.button("🔄 Refresh Data", width="stretch"):
             invalidate_cache('all')
             st.success("Cache cleared!")
             time.sleep(0.5)
             st.rerun()
         
         if st.session_state.admin_authenticated:
-            if st.button("🔒 Logout Admin", use_container_width=True):
+            if st.button("🔒 Logout Admin", width="stretch"):
                 st.session_state.admin_authenticated = False
                 st.success("Logged out")
                 time.sleep(0.5)
@@ -866,7 +896,7 @@ def render_cashier_page():
         elif max_qty < 5:
             st.warning(f"⚠️ Low stock: {max_qty} units remaining")
         
-        if st.button("➕ Add to Cart", use_container_width=True, disabled=(max_qty == 0)):
+        if st.button("➕ Add to Cart", width="stretch", disabled=(max_qty == 0)):
             cart_item = {
                 'product_id': selected_product['produk_id'],
                 'product_name': selected_product_name,
@@ -897,7 +927,7 @@ def render_cashier_page():
                         st.session_state.cart_items.pop(idx)
                         st.rerun()
             
-            if st.button("🗑 Clear Cart", use_container_width=True):
+            if st.button("🗑 Clear Cart", width="stretch"):
                 st.session_state.cart_items = []
                 st.rerun()
         else:
@@ -938,9 +968,9 @@ def render_cashier_page():
                 can_process = False
                 st.error("❌ Customer name required!")
             
-            if st.button("💳 PROCESS PAYMENT", use_container_width=True, type="primary", disabled=not can_process):
-                with st.spinner("Processing transaction..."):
-                    # 1. Jalankan Proses Database
+            if st.button("💳 PROCESS PAYMENT", width="stretch", type="primary", disabled=not can_process):
+                with st.spinner("Memproses transaksi..."):
+                    # ── 1. Jalankan proses database ──────────────────────────
                     if customer_id == "NEW_CUST":
                         success, message, transaction_id = process_transaction(
                             customer_id=customer_id,
@@ -957,37 +987,29 @@ def render_cashier_page():
                             items=st.session_state.cart_items,
                             discount=discount_amount
                         )
-                    
+
                     if success:
                         st.success(f"✓ {message}")
                         st.info(f"Transaction ID: **{transaction_id}**")
-                        
-                        # Tentukan nama pelanggan untuk ditampilkan di struk
-                        disp_name = new_customer_name if customer_id == "NEW_CUST" else "Guest"
-                        
-                        # 2. Render Struk di Layar dan Ambil HTML-nya untuk Print
-                        # Pastikan variabel subtotal, tax_amount, discount_amount, grand_total sudah dihitung di atas
-                        struk_html = render_receipt(
-                            items=st.session_state.cart_items,
-                            subtotal=subtotal, 
-                            tax=tax_amount, 
-                            discount=discount_amount, 
-                            total=grand_total,
-                            transaction_id=transaction_id,
-                            customer_name=disp_name
-                        )
-                        
-                        # 3. Logika Auto-print menggunakan Iframe (Kirim HTML struk_html)
-                        if st.checkbox("🖨️ Print Receipt", value=True, key="auto_print"):
-                            trigger_print_receipt(struk_html)
-                        
-                        # 4. Cleanup & Reset State
+
+                        # ── 2. Trigger print SEBELUM rerun ──────────────────
+                        # PENTING: trigger_print_receipt harus dipanggil dengan
+                        # transaction_id (bukan HTML). Jangan gunakan checkbox
+                        # di dalam blok button karena akan menyebabkan re-render.
+                        # Fungsi ini inject komponen iframe → browser langsung print.
+                        trigger_print_receipt(transaction_id)
+
+                        # ── 3. Cleanup state ─────────────────────────────────
                         st.session_state.cart_items = []
                         invalidate_cache('customers')
-                        
+
                         st.balloons()
-                        # Beri jeda 3 detik agar Iframe sempat memicu dialog print sebelum halaman refresh
-                        time.sleep(3)
+
+                        # ── 4. Jeda cukup agar iframe print sempat trigger ───
+                        # st.rerun() akan "membunuh" JavaScript yang belum selesai.
+                        # 4 detik memberi waktu browser memunculkan dialog print
+                        # sebelum halaman di-refresh Streamlit.
+                        time.sleep(4)
                         st.rerun()
                     else:
                         st.error(f"❌ {message}")
@@ -1220,7 +1242,7 @@ def render_history_page():
             with col2:
                 # REPRINT BUTTON - NEW FEATURE
                 st.markdown("### Actions")
-                if st.button("🖨️ Reprint Receipt", key=f"print_{trans['transaksi_id']}", use_container_width=True):
+                if st.button("🖨️ Reprint Receipt", key=f"print_{trans['transaksi_id']}", width="stretch"):
                     trigger_print_receipt(trans['transaksi_id'])
                     st.success("Sending to printer...")
                 
