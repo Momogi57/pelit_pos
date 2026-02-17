@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import time
 import hashlib
 import textwrap
+import io
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -268,7 +269,9 @@ def init_session_state():
         'cart_items': [],
         'current_page': 'Kasir',
         'admin_authenticated': False,
-        'last_transaction_id': None
+        'last_transaction_id': None,
+        'last_receipt_pdf': None,       # bytes: PDF struk transaksi terakhir
+        'last_receipt_trx_id': None,    # str:   ID transaksi untuk nama file PDF
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -450,6 +453,179 @@ def trigger_print_receipt(transaction_id: str):
 
     except Exception as e:
         st.error(f"❌ Print gagal: {str(e)}")
+
+
+def generate_receipt_pdf(transaction_id: str) -> Optional[bytes]:
+    """
+    Generate receipt PDF using reportlab.
+    Returns PDF bytes ready for st.download_button, or None on failure.
+    Struk width: 58mm thermal printer format.
+    """
+    try:
+        from reportlab.lib.pagesizes import portrait
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        from reportlab.lib import colors
+
+        # ── 1. Fetch data ────────────────────────────────────────────────────
+        trans_data = supabase.table("transaksi") \
+            .select("*, pelanggan(nama_pelanggan)") \
+            .eq("transaksi_id", transaction_id) \
+            .execute()
+        items_data = supabase.table("transaksi_item") \
+            .select("*") \
+            .eq("transaksi_id", transaction_id) \
+            .execute()
+
+        if not trans_data.data:
+            return None
+
+        trans  = trans_data.data[0]
+        items  = items_data.data if items_data.data else []
+        pelanggan    = trans.get('pelanggan')
+        customer_name = pelanggan.get('nama_pelanggan', 'Tamu') if isinstance(pelanggan, dict) else 'Tamu'
+
+        try:
+            tgl_raw = trans.get('tanggal_transaksi', '')
+            tgl = datetime.fromisoformat(tgl_raw.replace('Z', '+00:00')).strftime('%d/%m/%Y %H:%M')
+        except Exception:
+            tgl = str(trans.get('tanggal_transaksi', '-'))
+
+        # ── 2. Page size: 58mm wide, dynamic height ──────────────────────────
+        PAGE_W = 58 * mm
+        PAGE_H = 200 * mm   # Will auto-expand with content
+
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=(PAGE_W, PAGE_H),
+            leftMargin=3 * mm,
+            rightMargin=3 * mm,
+            topMargin=4 * mm,
+            bottomMargin=4 * mm
+        )
+
+        # ── 3. Styles ─────────────────────────────────────────────────────────
+        def style(name, **kw):
+            base = {
+                'fontName': 'Courier',
+                'fontSize': 7,
+                'leading': 9,
+                'textColor': colors.black
+            }
+            base.update(kw)
+            return ParagraphStyle(name, **base)
+
+        s_center  = style('center',  alignment=TA_CENTER, fontSize=7)
+        s_title   = style('title',   alignment=TA_CENTER, fontSize=10, fontName='Courier-Bold', leading=13)
+        s_sub     = style('sub',     alignment=TA_CENTER, fontSize=7)
+        s_normal  = style('normal',  alignment=TA_LEFT)
+        s_bold    = style('bold',    alignment=TA_LEFT,   fontName='Courier-Bold')
+        s_right   = style('right',   alignment=TA_RIGHT,  fontName='Courier-Bold')
+        s_total   = style('total',   alignment=TA_RIGHT,  fontSize=9, fontName='Courier-Bold')
+
+        def hr():
+            return HRFlowable(width="100%", thickness=0.5, color=colors.black, dash=(2, 2))
+
+        # ── 4. Build story ────────────────────────────────────────────────────
+        story = []
+
+        # Header
+        story.append(Paragraph("** PelitPos **", s_title))
+        story.append(Paragraph("gk medit gk sugeh ta?", s_sub))
+        story.append(Spacer(1, 2*mm))
+        story.append(hr())
+        story.append(Spacer(1, 1*mm))
+
+        # Transaction info
+        story.append(Paragraph(f"ID  : {trans['transaksi_id']}", s_normal))
+        story.append(Paragraph(f"Tgl : {tgl}", s_normal))
+        story.append(Paragraph(f"Plg : {customer_name}", s_normal))
+        story.append(Spacer(1, 1*mm))
+        story.append(hr())
+        story.append(Spacer(1, 1*mm))
+
+        # Items table
+        item_data_rows = [
+            # Header row
+            [Paragraph("Produk", s_bold), Paragraph("Subtotal", s_right)]
+        ]
+        for item in items:
+            nama   = str(item.get('nama_produk', ''))
+            jumlah = int(item.get('jumlah', 0))
+            harga  = float(item.get('harga_satuan', 0))
+            subtot = float(item.get('subtotal', 0))
+            # Product name + detail (2 lines in one cell)
+            cell_left = Paragraph(
+                f"{nama}<br/><font size='6' color='grey'>{jumlah} x {format_currency(harga)}</font>",
+                s_normal
+            )
+            cell_right = Paragraph(format_currency(subtot), s_right)
+            item_data_rows.append([cell_left, cell_right])
+
+        col_w = [PAGE_W * 0.60 - 6*mm, PAGE_W * 0.40]
+        tbl = Table(item_data_rows, colWidths=col_w)
+        tbl.setStyle(TableStyle([
+            ('FONTNAME',    (0, 0), (-1, 0),  'Courier-Bold'),
+            ('FONTSIZE',    (0, 0), (-1, -1), 7),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f5f5')]),
+            ('LINEBELOW',   (0, 0), (-1, 0),  0.5, colors.black),
+            ('ALIGN',       (1, 0), (1, -1),  'RIGHT'),
+            ('VALIGN',      (0, 0), (-1, -1), 'TOP'),
+            ('TOPPADDING',  (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 1*mm))
+        story.append(hr())
+        story.append(Spacer(1, 1*mm))
+
+        # Summary
+        subtotal_val = float(trans.get('subtotal', 0))
+        ppn_val      = float(trans.get('ppn', 0))
+        diskon_val   = float(trans.get('diskon', 0))
+        total_val    = float(trans.get('total_bayar', 0))
+
+        summary_rows = [
+            [Paragraph("Subtotal", s_normal), Paragraph(format_currency(subtotal_val), s_right)],
+            [Paragraph("PPN 11%",  s_normal), Paragraph(format_currency(ppn_val),      s_right)],
+            [Paragraph("Diskon",   s_normal), Paragraph(f"-{format_currency(diskon_val)}", s_right)],
+        ]
+        sum_tbl = Table(summary_rows, colWidths=col_w)
+        sum_tbl.setStyle(TableStyle([
+            ('FONTSIZE',  (0, 0), (-1, -1), 7),
+            ('ALIGN',     (1, 0), (1, -1),  'RIGHT'),
+            ('TOPPADDING',    (0, 0), (-1, -1), 1),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
+        ]))
+        story.append(sum_tbl)
+        story.append(Spacer(1, 1*mm))
+        story.append(hr())
+        story.append(Spacer(1, 1*mm))
+
+        # Grand total
+        story.append(Paragraph(f"TOTAL: {format_currency(total_val)}", s_total))
+        story.append(Spacer(1, 2*mm))
+        story.append(hr())
+        story.append(Spacer(1, 1*mm))
+
+        # Footer
+        story.append(Paragraph("*** TERIMA KASIH ***", s_center))
+        story.append(Paragraph("Semoga berkah & sukses selalu", s_center))
+
+        # ── 5. Build PDF ──────────────────────────────────────────────────────
+        doc.build(story)
+        return buf.getvalue()
+
+    except ImportError:
+        st.error("❌ Library `reportlab` belum terinstall. Tambahkan ke requirements.txt: `reportlab`")
+        return None
+    except Exception as e:
+        st.error(f"❌ Gagal generate PDF: {str(e)}")
+        return None
+
 
 # ============================================================================
 # DATABASE OPERATIONS
@@ -992,29 +1168,50 @@ def render_cashier_page():
                         st.success(f"✓ {message}")
                         st.info(f"Transaction ID: **{transaction_id}**")
 
-                        # ── 2. Trigger print SEBELUM rerun ──────────────────
-                        # PENTING: trigger_print_receipt harus dipanggil dengan
-                        # transaction_id (bukan HTML). Jangan gunakan checkbox
-                        # di dalam blok button karena akan menyebabkan re-render.
-                        # Fungsi ini inject komponen iframe → browser langsung print.
+                        # ── 2. Trigger print iframe ──────────────────────────
                         trigger_print_receipt(transaction_id)
 
-                        # ── 3. Cleanup state ─────────────────────────────────
+                        # ── 3. Generate PDF & simpan ke session_state ────────
+                        # Download button tidak bisa ada di dalam blok if button,
+                        # jadi kita simpan dulu, lalu render di luar blok ini.
+                        pdf_bytes = generate_receipt_pdf(transaction_id)
+                        if pdf_bytes:
+                            st.session_state.last_receipt_pdf    = pdf_bytes
+                            st.session_state.last_receipt_trx_id = transaction_id
+
+                        # ── 4. Cleanup state ─────────────────────────────────
                         st.session_state.cart_items = []
                         invalidate_cache('customers')
 
                         st.balloons()
 
-                        # ── 4. Jeda cukup agar iframe print sempat trigger ───
-                        # st.rerun() akan "membunuh" JavaScript yang belum selesai.
-                        # 4 detik memberi waktu browser memunculkan dialog print
-                        # sebelum halaman di-refresh Streamlit.
+                        # ── 5. Jeda agar iframe sempat trigger print ─────────
                         time.sleep(4)
                         st.rerun()
                     else:
                         st.error(f"❌ {message}")
         else:
             st.info("Add items to preview receipt")
+
+        # ── Download PDF button ──────────────────────────────────────────────
+        # Dirender di LUAR blok if st.button agar tidak hilang saat re-render.
+        # PDF disimpan di session_state setelah transaksi berhasil.
+        if st.session_state.get('last_receipt_pdf') and st.session_state.get('last_receipt_trx_id'):
+            trx_id_pdf = st.session_state.last_receipt_trx_id
+            st.markdown("---")
+            st.markdown(f"**Struk terakhir:** `{trx_id_pdf}`")
+            st.download_button(
+                label="⬇️ Download PDF Struk",
+                data=st.session_state.last_receipt_pdf,
+                file_name=f"struk_{trx_id_pdf}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="download_last_pdf"
+            )
+            if st.button("✕ Hapus Struk Tersimpan", key="clear_pdf"):
+                st.session_state.last_receipt_pdf    = None
+                st.session_state.last_receipt_trx_id = None
+                st.rerun()
 
 
 def render_master_data_page():
@@ -1240,19 +1437,34 @@ def render_history_page():
                     st.info("Item details not available")
             
             with col2:
-                # REPRINT BUTTON - NEW FEATURE
+                # ACTIONS - Print + Download PDF
                 st.markdown("### Actions")
-                if st.button("🖨️ Reprint Receipt", key=f"print_{trans['transaksi_id']}", width="stretch"):
+
+                # 🖨️ Print (dialog browser)
+                if st.button("🖨️ Cetak Struk", key=f"print_{trans['transaksi_id']}", width="stretch"):
                     trigger_print_receipt(trans['transaksi_id'])
-                    st.success("Sending to printer...")
-                
+                    st.success("Dialog print terbuka!")
+
+                # ⬇️ Download PDF (tanpa printer)
+                with st.spinner("Menyiapkan PDF..."):
+                    pdf_bytes = generate_receipt_pdf(trans['transaksi_id'])
+                if pdf_bytes:
+                    st.download_button(
+                        label="⬇️ Download PDF",
+                        data=pdf_bytes,
+                        file_name=f"struk_{trans['transaksi_id']}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key=f"pdf_{trans['transaksi_id']}"
+                    )
+
                 # Mini summary
                 st.markdown("---")
-                st.markdown("**Summary:**")
-                for item in items[:3]:  # Show first 3 items
+                st.markdown("**Items:**")
+                for item in items[:3]:
                     st.caption(f"{item['nama_produk']} x{item['jumlah']}")
                 if len(items) > 3:
-                    st.caption(f"... and {len(items)-3} more")
+                    st.caption(f"... dan {len(items)-3} lainnya")
 
 def render_dashboard_page():
     """Analytics dashboard with PPN insights - Admin only"""
